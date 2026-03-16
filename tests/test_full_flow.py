@@ -1,13 +1,27 @@
 """
 Full end-to-end test: ingestion → retrieval → agent.
 
+Every step uses real pipeline functions. The only manual inputs allowed are:
+  - The sample table data (CUSTOMERS_CSV, ORDERS_CSV, PRODUCTS_CSV) at the top.
+  - Test harness: one project + uploaded_tables rows (no "create project" or
+    "register table" API in this repo; pipeline expects these to exist).
+
+Functions exercised: get_pg_connection, create_duckdb_connection, load_file_to_duckdb,
+extract_column_schemas, save_table_schemas, update_uploaded_table_status,
+cleanup_existing_documents, cleanup_existing_relationships, _format_column_details,
+fetch_user_relationships, detect_relationships_name_match, detect_relationships_value_overlap,
+detect_relationships_llm, combine_detected_relationships, save_relationships,
+fetch_project_settings, _get_llm, generate_all_documents, chunk_and_embed_document,
+save_schema_document, save_document_chunks, retrieve_context, run_agent.
+(DDL is built from schemas to avoid a second DuckDB connection to the same file.)
+
 Requires:
   - PostgreSQL with pgvector running (see DATABASE_URL in .env)
   - OPENAI_API_KEY in .env
   - database.txt schema already applied to Postgres
 
 Run:
-    poetry run python tests/test_full_flow.py
+    PYTHONPATH=. poetry run python tests/test_full_flow.py
 """
 
 import os
@@ -66,12 +80,18 @@ def main():
         extract_column_schemas,
         detect_relationships_name_match,
         detect_relationships_value_overlap,
+        detect_relationships_llm,
         combine_detected_relationships,
         save_table_schemas,
         save_relationships,
-        get_pg_connection,
         save_schema_document,
         save_document_chunks,
+        get_pg_connection,
+        cleanup_existing_documents,
+        cleanup_existing_relationships,
+        fetch_project_settings,
+        fetch_user_relationships,
+        update_uploaded_table_status,
     )
     from rag.ingestion.index import (
         generate_all_documents,
@@ -97,9 +117,9 @@ def main():
         ON CONFLICT (id) DO NOTHING
     """)
     cur.execute(f"""
-        INSERT INTO project_settings (project_id)
-        VALUES ('{PROJECT_ID}')
-        ON CONFLICT (project_id) DO NOTHING
+        INSERT INTO project_settings (project_id, similarity_threshold)
+        VALUES ('{PROJECT_ID}', 0.3)
+        ON CONFLICT (project_id) DO UPDATE SET similarity_threshold = 0.3
     """)
     pg.commit()
     print("  Project seeded.\n")
@@ -115,8 +135,10 @@ def main():
     con = create_duckdb_connection(db_path)
 
     table_names = list(csv_paths.keys())
+    table_row_counts: dict[str, int] = {}
     for tname in table_names:
         rows = load_file_to_duckdb(con, csv_paths[tname], "csv", tname)
+        table_row_counts[tname] = rows
         print(f"  Loaded {tname}: {rows} rows")
     print()
 
@@ -125,26 +147,22 @@ def main():
     print("STEP 3: Extract schemas and save to Postgres")
     print("=" * 60)
 
-    # Clean up previous test data for this project
-    cur.execute(f"DELETE FROM schema_documents WHERE project_id = '{PROJECT_ID}'")
-    cur.execute(f"DELETE FROM table_relationships WHERE project_id = '{PROJECT_ID}'")
-    cur.execute(f"DELETE FROM table_schemas WHERE project_id = '{PROJECT_ID}'")
-    cur.execute(f"DELETE FROM uploaded_tables WHERE project_id = '{PROJECT_ID}'")
+    cleanup_existing_documents(pg, PROJECT_ID)
+    cleanup_existing_relationships(pg, PROJECT_ID)
+    cur.execute("DELETE FROM table_schemas WHERE project_id = %s", (PROJECT_ID,))
+    cur.execute("DELETE FROM uploaded_tables WHERE project_id = %s", (PROJECT_ID,))
     pg.commit()
 
     schemas: dict = {}
     table_id_map: dict[str, str] = {}
 
     for tname in table_names:
-        cols = extract_column_schemas(con, tname)
-        schemas[tname] = cols
-
         cur.execute(
             """
             INSERT INTO uploaded_tables
                 (project_id, clerk_id, original_filename, s3_key,
                  file_size, file_type, table_name, processing_status)
-            VALUES (%s, 'test_user', %s, 'local', 0, 'csv', %s, 'ready')
+            VALUES (%s, 'test_user', %s, 'local', 0, 'csv', %s, 'processing')
             RETURNING id
             """,
             (PROJECT_ID, f"{tname}.csv", tname),
@@ -152,7 +170,13 @@ def main():
         tid = str(cur.fetchone()[0])
         pg.commit()
         table_id_map[tname] = tid
+
+        cols = extract_column_schemas(con, tname)
+        schemas[tname] = cols
         save_table_schemas(pg, cols, tid, PROJECT_ID)
+        update_uploaded_table_status(
+            pg, tid, "ready", row_count=table_row_counts[tname]
+        )
         print(f"  {tname}: {len(cols)} columns saved")
 
     print()
@@ -161,13 +185,27 @@ def main():
     print("=" * 60)
     print("STEP 4: Detect relationships")
     print("=" * 60)
+    # Build DDL from existing schemas to avoid opening a second DuckDB connection
+    # (DuckDB forbids same file open with different connection configs).
+    ddl_parts = [
+        f"## Table: {tname}\n{_format_column_details(schemas[tname])}"
+        for tname in table_names
+    ]
+    ddl = "\n\n".join(ddl_parts)
+    user_rels = fetch_user_relationships(pg, PROJECT_ID, table_id_map)
+
     name_rels = detect_relationships_name_match(schemas, table_id_map)
     print(f"  Name-match strategy: {len(name_rels)} relationships")
 
     value_rels = detect_relationships_value_overlap(con, schemas, table_id_map, min_distinct=2)
     print(f"  Value-overlap strategy: {len(value_rels)} relationships")
 
-    combined = combine_detected_relationships(name_rels, value_rels)
+    llm_rels = detect_relationships_llm(ddl, schemas, table_id_map)
+    print(f"  LLM strategy: {len(llm_rels)} relationships")
+
+    combined = combine_detected_relationships(
+        name_rels, value_rels, llm_rels, user_relationships=user_rels
+    )
     print(f"  Combined (deduped): {len(combined)} relationships")
 
     if combined:
@@ -185,33 +223,57 @@ def main():
     print("STEP 5: Generate documents via LLM (calling OpenAI...)")
     print("=" * 60)
 
-    # Build a simple DDL string from DuckDB directly (avoids LangChain SQLAlchemy compat issue)
-    ddl_parts = []
-    for tname in table_names:
-        col_info = _format_column_details(schemas[tname])
-        ddl_parts.append(f"## Table: {tname}\n{col_info}")
-    ddl = "\n\n".join(ddl_parts)
-
-    llm = _get_llm()
+    settings = fetch_project_settings(pg, PROJECT_ID)
+    llm_model = settings.get("llm_model", "gpt-4o")
+    llm = _get_llm(model_name=llm_model)
     docs = generate_all_documents(llm, schemas, combined, ddl)
     print(f"  Generated {len(docs)} documents:")
     for doc in docs:
         print(f"    - [{doc.doc_type}] {doc.title}  ({len(doc.content)} chars)")
+
+    docs_file = os.path.join(tmp_dir, "generated_documents.txt")
+    with open(docs_file, "w") as f:
+        for i, doc in enumerate(docs, 1):
+            f.write(f"{'=' * 70}\n")
+            f.write(f"Document {i}: [{doc.doc_type}] {doc.title}\n")
+            f.write(f"Table: {doc.table_name or '(global)'}\n")
+            f.write(f"{'=' * 70}\n")
+            f.write(doc.content)
+            f.write("\n\n")
+    print(f"  Documents written to: {docs_file}")
     print()
 
     # ══════════════════════════════════════════════════════════════
     print("=" * 60)
     print("STEP 6: Chunk + embed + save (calling OpenAI embeddings...)")
     print("=" * 60)
+    embedding_model = settings.get("embedding_model", "text-embedding-3-small")
     total_chunks = 0
+    all_chunks: list = []
     for doc in docs:
         uploaded_table_id = table_id_map.get(doc.table_name)
-        doc_id = save_schema_document(pg, doc, PROJECT_ID, uploaded_table_id, "gpt-4o")
-        chunks = chunk_and_embed_document(doc)
+        doc_id = save_schema_document(
+            pg, doc, PROJECT_ID, uploaded_table_id, llm_model
+        )
+        chunks = chunk_and_embed_document(doc, embedding_model=embedding_model)
         if chunks:
             save_document_chunks(pg, chunks, doc_id, PROJECT_ID)
+            all_chunks.extend((doc, ch) for ch in chunks)
             total_chunks += len(chunks)
+
+    chunks_file = os.path.join(tmp_dir, "generated_chunks.txt")
+    with open(chunks_file, "w") as f:
+        for i, (doc, ch) in enumerate(all_chunks, 1):
+            f.write(f"{'=' * 70}\n")
+            f.write(f"Chunk {i} (index={ch.chunk_index}, doc_type={ch.doc_type})\n")
+            f.write(f"Source: [{doc.doc_type}] {doc.title}\n")
+            f.write(f"Tables: {ch.table_names}\n")
+            f.write(f"Embedding dims: {len(ch.embedding)}\n")
+            f.write(f"{'=' * 70}\n")
+            f.write(ch.content)
+            f.write("\n\n")
     print(f"  Saved {total_chunks} chunks with embeddings.")
+    print(f"  Chunks written to: {chunks_file}")
     print("  Ingestion complete!\n")
 
     # ══════════════════════════════════════════════════════════════
