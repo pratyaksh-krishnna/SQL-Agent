@@ -1,0 +1,354 @@
+-- ============================================================
+-- SQL Agent RAG Schema
+-- PostgreSQL migration — vector search + full-text search
+-- ============================================================
+
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "vector";
+
+-- ============================================================
+-- USERS
+-- ============================================================
+CREATE TABLE users (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    clerk_id    TEXT NOT NULL UNIQUE,
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- PROJECTS
+-- Each project = one database / set of related tables the
+-- user is querying against.
+-- ============================================================
+CREATE TABLE projects (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL,
+    description TEXT,
+    clerk_id    TEXT NOT NULL REFERENCES users(clerk_id) ON DELETE CASCADE,
+    created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- PROJECT SETTINGS
+-- RAG + agent tuning params per project
+-- ============================================================
+CREATE TABLE project_settings (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id            UUID NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+    embedding_model       TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    llm_model             TEXT NOT NULL DEFAULT 'gpt-4o',
+    chunks_per_search     INTEGER NOT NULL DEFAULT 5,
+    final_context_size    INTEGER NOT NULL DEFAULT 10,
+    similarity_threshold  DECIMAL NOT NULL DEFAULT 0.75,
+    number_of_queries     INTEGER NOT NULL DEFAULT 3,   -- multi-query expansion
+    reranking_enabled     BOOLEAN NOT NULL DEFAULT true,
+    reranking_model       TEXT NOT NULL DEFAULT 'cohere-rerank-v3',
+    vector_weight         DECIMAL NOT NULL DEFAULT 0.7,
+    keyword_weight        DECIMAL NOT NULL DEFAULT 0.3,
+    -- SQL-specific settings
+    max_rows_returned     INTEGER NOT NULL DEFAULT 500,
+    query_timeout_ms      INTEGER NOT NULL DEFAULT 30000,
+    allow_write_queries   BOOLEAN NOT NULL DEFAULT false,  -- safety gate
+    created_at            TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- UPLOADED TABLES
+-- Raw files the user uploads (CSV, SQL dump, Excel, etc.)
+-- ============================================================
+CREATE TABLE uploaded_tables (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id        UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    clerk_id          TEXT NOT NULL REFERENCES users(clerk_id) ON DELETE CASCADE,
+    original_filename TEXT NOT NULL,
+    s3_key            TEXT NOT NULL,                  -- raw file in object storage
+    file_size         INTEGER NOT NULL,
+    file_type         TEXT NOT NULL,                  -- 'csv', 'sql', 'xlsx', 'json'
+    table_name        TEXT NOT NULL,                  -- logical name used in queries
+    processing_status TEXT NOT NULL DEFAULT 'pending',-- pending | processing | ready | failed
+    task_id           TEXT,                           -- async task reference
+    row_count         INTEGER,                        -- populated after processing
+    processing_details JSON DEFAULT '{}',
+    created_at        TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- TABLE SCHEMAS
+-- Column-level metadata extracted from uploaded tables
+-- ============================================================
+CREATE TABLE table_schemas (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    uploaded_table_id UUID NOT NULL REFERENCES uploaded_tables(id) ON DELETE CASCADE,
+    project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    column_name     TEXT NOT NULL,
+    data_type       TEXT NOT NULL,          -- inferred type: text, integer, decimal, date, boolean …
+    is_nullable     BOOLEAN NOT NULL DEFAULT true,
+    is_primary_key  BOOLEAN NOT NULL DEFAULT false,
+    is_foreign_key  BOOLEAN NOT NULL DEFAULT false,
+    sample_values   JSON DEFAULT '[]',      -- up to 5 representative values for context
+    column_index    INTEGER NOT NULL,       -- original column order
+    description     TEXT,                  -- auto-generated or user-edited column description
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (uploaded_table_id, column_name)
+);
+
+-- ============================================================
+-- TABLE RELATIONSHIPS
+-- Detected or user-defined FK / join relationships
+-- between uploaded tables within the same project
+-- ============================================================
+CREATE TABLE table_relationships (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id           UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    -- "many" side
+    from_table_id        UUID NOT NULL REFERENCES uploaded_tables(id) ON DELETE CASCADE,
+    from_column          TEXT NOT NULL,
+    -- "one" side
+    to_table_id          UUID NOT NULL REFERENCES uploaded_tables(id) ON DELETE CASCADE,
+    to_column            TEXT NOT NULL,
+    relationship_type    TEXT NOT NULL DEFAULT 'many_to_one', -- many_to_one | one_to_one | many_to_many
+    confidence           DECIMAL DEFAULT 1.0,  -- 0-1 if auto-detected; 1.0 if user-confirmed
+    detection_method     TEXT DEFAULT 'user',  -- 'user' | 'auto_name_match' | 'auto_value_overlap'
+    created_at           TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- SCHEMA DOCUMENTS
+-- Human-readable docs generated from table schemas +
+-- relationships. These are what gets chunked and embedded
+-- for RAG retrieval.
+-- ============================================================
+CREATE TABLE schema_documents (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id        UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    uploaded_table_id UUID REFERENCES uploaded_tables(id) ON DELETE CASCADE, -- NULL = cross-table relationship doc
+    doc_type          TEXT NOT NULL,  -- 'table_overview' | 'column_detail' | 'relationship' | 'join_guide'
+    title             TEXT NOT NULL,
+    content           TEXT NOT NULL,  -- the full generated markdown/text doc
+    generation_model  TEXT,           -- which LLM generated this doc
+    created_at        TIMESTAMPTZ DEFAULT now(),
+    updated_at        TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- DOCUMENT CHUNKS
+-- Chunks of schema_documents with embeddings for RAG
+-- ============================================================
+CREATE TABLE document_chunks (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id  UUID NOT NULL REFERENCES schema_documents(id) ON DELETE CASCADE,
+    project_id   UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    content      TEXT NOT NULL,
+    chunk_index  INTEGER NOT NULL,
+    char_count   INTEGER NOT NULL,
+    -- metadata for filtering / boosting
+    doc_type     TEXT NOT NULL,   -- mirrors schema_documents.doc_type for fast filtering
+    table_names  TEXT[],          -- which table(s) this chunk is about
+    -- vector + FTS
+    embedding    vector(1536) NOT NULL,
+    fts          tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+    created_at   TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- CHATS
+-- Conversation sessions per project
+-- ============================================================
+CREATE TABLE chats (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title      TEXT NOT NULL DEFAULT 'New Chat',
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    clerk_id   TEXT NOT NULL REFERENCES users(clerk_id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- MESSAGES
+-- Individual turns in a chat
+-- ============================================================
+CREATE TABLE messages (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    chat_id    UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    clerk_id   TEXT NOT NULL REFERENCES users(clerk_id) ON DELETE CASCADE,
+    role       TEXT NOT NULL DEFAULT 'user',  -- 'user' | 'assistant' | 'system'
+    content    TEXT NOT NULL,                 -- natural-language message
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- QUERY EXECUTIONS
+-- Every SQL query the agent generates + its results.
+-- Linked to the message that triggered it.
+-- ============================================================
+CREATE TABLE query_executions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id      UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    chat_id         UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    clerk_id        TEXT NOT NULL REFERENCES users(clerk_id) ON DELETE CASCADE,
+    -- the SQL
+    generated_sql   TEXT NOT NULL,
+    sql_explanation TEXT,                     -- agent's plain-English explanation of the query
+    -- execution outcome
+    status          TEXT NOT NULL DEFAULT 'pending', -- pending | success | error | timeout
+    error_message   TEXT,
+    row_count       INTEGER,
+    execution_ms    INTEGER,                  -- wall-clock runtime
+    -- result payload (stored as JSONB for flexibility)
+    result_columns  JSON DEFAULT '[]',        -- [{name, type}, …]
+    result_rows     JSON DEFAULT '[]',        -- array of row objects (capped at max_rows_returned)
+    result_summary  TEXT,                     -- LLM-generated one-paragraph answer
+    -- RAG provenance
+    retrieved_chunk_ids UUID[],               -- which chunks were used to build context
+    reranked_chunk_ids  UUID[],               -- post-rerank shortlist
+    trace_id        TEXT,                     -- observability / LangSmith trace
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- CHUNK RETRIEVAL LOG  (optional — useful for evals / tuning)
+-- Records every RAG retrieval event and scores
+-- ============================================================
+CREATE TABLE chunk_retrieval_log (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    query_exec_id   UUID NOT NULL REFERENCES query_executions(id) ON DELETE CASCADE,
+    chunk_id        UUID NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+    vector_score    DECIMAL,
+    keyword_score   DECIMAL,
+    hybrid_score    DECIMAL,
+    rerank_score    DECIMAL,
+    was_used        BOOLEAN NOT NULL DEFAULT false,  -- made it into final context?
+    retrieval_query TEXT,                            -- the (possibly expanded) query used
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- ============================================================
+-- INDEXES
+-- ============================================================
+
+-- Vector similarity search (HNSW — fast approximate NN)
+CREATE INDEX document_chunks_embedding_hnsw_idx
+    ON document_chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Full-text search
+CREATE INDEX document_chunks_fts_idx
+    ON document_chunks USING gin (fts);
+
+-- Common lookups
+CREATE INDEX idx_document_chunks_project     ON document_chunks (project_id);
+CREATE INDEX idx_document_chunks_doc_type    ON document_chunks (doc_type);
+CREATE INDEX idx_document_chunks_table_names ON document_chunks USING gin (table_names);
+
+CREATE INDEX idx_schema_documents_project    ON schema_documents (project_id);
+CREATE INDEX idx_schema_documents_table      ON schema_documents (uploaded_table_id);
+
+CREATE INDEX idx_table_schemas_table         ON table_schemas (uploaded_table_id);
+CREATE INDEX idx_table_relationships_project ON table_relationships (project_id);
+CREATE INDEX idx_table_relationships_from    ON table_relationships (from_table_id);
+CREATE INDEX idx_table_relationships_to      ON table_relationships (to_table_id);
+
+CREATE INDEX idx_uploaded_tables_project     ON uploaded_tables (project_id);
+CREATE INDEX idx_query_executions_message    ON query_executions (message_id);
+CREATE INDEX idx_query_executions_project    ON query_executions (project_id);
+CREATE INDEX idx_messages_chat               ON messages (chat_id);
+CREATE INDEX idx_chats_project               ON chats (project_id);
+CREATE INDEX idx_chunk_retrieval_log_exec    ON chunk_retrieval_log (query_exec_id);
+
+
+-- Vector search function for SQL agent
+CREATE OR REPLACE FUNCTION vector_search_document_chunks(
+    query_embedding      vector,
+    filter_project_id    uuid,
+    match_threshold      double precision DEFAULT 0.3,
+    chunks_per_search    integer          DEFAULT 20,
+    filter_doc_type      text             DEFAULT NULL,   -- e.g. 'table_overview'
+    filter_table_names   text[]           DEFAULT NULL    -- e.g. ARRAY['orders','customers']
+)
+RETURNS TABLE(
+    id            uuid,
+    document_id   uuid,
+    project_id    uuid,
+    content       text,
+    chunk_index   integer,
+    char_count    integer,
+    doc_type      text,
+    table_names   text[],
+    similarity    double precision,
+    created_at    timestamptz
+)
+LANGUAGE sql
+AS $function$
+SELECT
+    dc.id,
+    dc.document_id,
+    dc.project_id,
+    dc.content,
+    dc.chunk_index,
+    dc.char_count,
+    dc.doc_type,
+    dc.table_names,
+    (1 - (dc.embedding <=> query_embedding))::double precision AS similarity,
+    dc.created_at
+FROM
+    document_chunks dc
+WHERE
+    dc.project_id = filter_project_id
+    AND dc.embedding IS NOT NULL
+    AND (1 - (dc.embedding <=> query_embedding)) > match_threshold
+    -- optional: filter to a specific doc type
+    AND (filter_doc_type IS NULL OR dc.doc_type = filter_doc_type)
+    -- optional: filter to chunks about specific tables
+    AND (filter_table_names IS NULL OR dc.table_names && filter_table_names)
+ORDER BY
+    dc.embedding <=> query_embedding ASC
+LIMIT
+    chunks_per_search;
+$function$;
+
+
+-- Keyword search function for SQL agent
+CREATE OR REPLACE FUNCTION keyword_search_document_chunks(
+    query_text           text,
+    filter_project_id    uuid,
+    chunks_per_search    integer DEFAULT 20,
+    filter_doc_type      text    DEFAULT NULL,
+    filter_table_names   text[]  DEFAULT NULL
+)
+RETURNS TABLE(
+    id            uuid,
+    document_id   uuid,
+    project_id    uuid,
+    content       text,
+    chunk_index   integer,
+    char_count    integer,
+    doc_type      text,
+    table_names   text[],
+    keyword_rank  double precision,
+    created_at    timestamptz
+)
+LANGUAGE sql
+AS $function$
+SELECT
+    dc.id,
+    dc.document_id,
+    dc.project_id,
+    dc.content,
+    dc.chunk_index,
+    dc.char_count,
+    dc.doc_type,
+    dc.table_names,
+    ts_rank_cd(dc.fts, websearch_to_tsquery('english', query_text))::double precision AS keyword_rank,
+    dc.created_at
+FROM
+    document_chunks dc
+WHERE
+    dc.project_id = filter_project_id
+    AND dc.fts @@ websearch_to_tsquery('english', query_text)
+    AND (filter_doc_type IS NULL OR dc.doc_type = filter_doc_type)
+    AND (filter_table_names IS NULL OR dc.table_names && filter_table_names)
+ORDER BY
+    keyword_rank DESC
+LIMIT
+    chunks_per_search;
+$function$;
