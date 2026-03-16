@@ -118,6 +118,4 @@ The ingestion pipeline (see `rag/ingestion/index.py`) is intended to be run when
 - **PostgreSQL + pgvector** – storage for schemas, relationships, document chunks, and vector search
 - **FastAPI** – listed as a dependency for API use (see `rag/retreival` for HTTP-oriented code)
 
-## License
 
-See repository license (if any).
